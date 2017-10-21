@@ -257,31 +257,68 @@ TABLE maps keys to indexes, starting from zero."
 ;;; generic implementation -- the class is not exported, only the functionality
 
 (defclass data ()
-  ((ordered-keys
-    :initarg :ordered-keys
-    :type ordered-keys)
-   (columns
-    :initarg :columns
-    :type vector))
-  (:documentation "This class is used for implementing both data-vector and data-matrix, and represents and ordered collection of key-column pairs.  Columns are not assumed to have any specific attributes.  This class is not exported."))
+  ((ordered-keys     :initarg  :ordered-keys     :type     ordered-keys)
+   (columns          :initarg  :columns          :type     vector)
+   (column-type      :initarg  :column-type      :accessor get-column-type      :type vector)
+   (incomplete-cases :initarg  :incomplete-cases :accessor get-incomplete-cases :type vector)
+   (print-widths     :accessor get-print-widths  :initarg  :print-widths))
+  (:documentation "This class is used for implementing both data-vector and data-matrix, and represents and ordered collection of key-column pairs.  Columns are assumed to be of type column-type (NUMBER, DATE, CATEGORY, STRING).  This class is not exported."))
 
 (defmethod aops:element-type ((data data))
   t)
 
-(defun make-data (class keys columns)
-  "Create a DATA object from KEYS and COLUMNS.  FOR INTERNAL USE.  Always creates a copy of COLUMNS in order to ensure that it is an adjustable array with a fill pointer.  KEYS are converted to ORDERED-KEYS if necessary."
-  (let ((n-columns (length columns))
-        (ordered-keys (atypecase keys
-                        (ordered-keys it)
-                        (t (ordered-keys it)))))
-    (assert (= n-columns (keys-count ordered-keys)))
+
+(defun reduce-column ( function column )
+  "reduce a column of a df with function yielding a scalar"
+  
+  (loop with result = (aref column 0)
+	for i from 1 below (length column) do
+       (if (eql (aref column i) 'na)
+	   (warn "reducing incomplete case. case ~a skipped~%" i)
+	   (setf result (funcall function result (aref  column i))))
+     finally (return result)))
+
+(defun determine-print-widths (cols types)
+  (loop for c in cols and type in types collect
+       (1+ (ecase type
+	  (NUMBER (log (reduce-column #'max c) 10))
+	  (DATE   (log (reduce-column #'max c) 10))
+	  (STRING (reduce-column #'max (mapcar #'length c)))
+	  (CATEGORY (reduce-column #'max (mapcar (lambda (s) (length (symbol-name s))) c)))))))
+
+
+(defun make-data (class keys columns &key (column-types t column-types-supplied-p) (incomplete-cases nil))
+  "Create a DATA object from KEYS and COLUMNS.  FOR INTERNAL USE.  Always creates a copy of COLUMNS in order to ensure that it is an adjustable array with a fill pointer.  KEYS are converted to ORDERED-KEYS if necessary. If column types are supplied as a list use them or make everything type t"
+  (let* ((n-columns (length columns))
+	 (n-rows (length (first columns)))
+	 (column-keys keys)
+	 (column-types (if column-types-supplied-p
+			   column-types
+			   (loop repeat n-columns collect t)))
+	 (ordered-keys (ordered-keys column-keys)))
+    (assert (= n-columns (keys-count ordered-keys) (length column-types)))
+    (if incomplete-cases
+	(assert (= (length (first columns)) (length incomplete-cases)))
+	(setf incomplete-cases (loop repeat n-rows collect nil)))
     (assert (subtypep class 'data))
     (make-instance class
                    :ordered-keys ordered-keys
                    :columns (make-array n-columns
                                         :adjustable t
                                         :fill-pointer n-columns
-                                        :initial-contents columns))))
+                                        :initial-contents columns)
+		   :column-type (make-array n-columns
+					    :adjustable t
+					    :fill-pointer n-columns
+					    :initial-contents column-types)
+		   :incomplete-cases (make-array n-rows
+						 :adjustable t
+						 :fill-pointer n-columns
+						 :initial-contents incomplete-cases)
+		   :print-widths (make-array n-rows
+						 :adjustable t
+						 :fill-pointer n-columns
+						 :initial-contents (determine-print-widths columns column-types)))))
 
 (defgeneric check-column-compatibility (data column)
   (:documentation "Check if COLUMN is compatible with DATA.")
@@ -330,6 +367,48 @@ TABLE maps keys to indexes, starting from zero."
   (check-type data data)
   (copy-seq (keys-vector (slot-value data 'ordered-keys))))
 
+(defun types (data)
+  "types of each column"
+  (check-type data data)
+  (copy-seq (slot-value data 'column-type)))
+
+(defun keys-and-types-alist (data)
+  "construct an alist of keys and types"
+  
+  (loop for key across (keys data) and type across (types data) 
+     collect (cons key type)))
+
+(defun make-categorical (data key)
+  "make a column a categorical variable, convert entries to symbols. Only works on string columns"
+  (check-type data data)
+  (assert (eql 'string (column-type data key)))
+  (let+ ((column (column data key))
+	 ((&slots ordered-keys ) data)
+	 (count 0))
+    (map-into column (lambda (x) (alexandria:symbolicate x)
+			(incf count)) column)
+    (format t "~a entries processed~%" count)
+    (setf (aref (get-column-type data) (key-index ordered-keys key)) :CATEGORY))
+  (values))
+
+(defun recode (data key old new)
+  "change a value in a column from old to new"
+  (check-type data data)
+  
+  (let+ ((column (column data key))
+	 (comparison (ecase (column-type data key)
+		       (NUMBER #'=)
+		       (DATE #'=)
+		       (STRING #'string=)
+		       (:CATEGORY #'eql)))
+	 (count 0))
+    (map-into column (lambda (item) (if (funcall comparison item old)
+				   new
+				   item)
+			(incf count)) column)
+   (format t "entries processed ~a~%" count))
+  (values))
+
 (defmethod as-alist ((data data))
   "Key-column pairs as an alist."
   (map 'list #'cons (keys data) (columns data)))
@@ -339,7 +418,7 @@ TABLE maps keys to indexes, starting from zero."
   (check-type data data)
   (let+ (((&slots-r/o ordered-keys columns) data))
     (make-data (class-of data)
-               (copy-ordered-keys ordered-keys)
+               (keys-and-types-alist  data)
                (map 'vector key columns))))
 
 (defun column (data key)
@@ -347,6 +426,12 @@ TABLE maps keys to indexes, starting from zero."
   (check-type data data)
   (let+ (((&slots-r/o ordered-keys columns) data))
     (aref columns (key-index ordered-keys key))))
+
+(defun column-type (data key)
+  "Return column corresponding to key."
+  (check-type data data)
+  (let+ (((&slots-r/o ordered-keys column-type) data))
+    (aref column-type (key-index ordered-keys key))))
 
 (defun (setf column) (column data key)
   "Set column corresponding to key."
@@ -394,8 +479,8 @@ TABLE maps keys to indexes, starting from zero."
     `(progn
        (defclass ,class (data)
          ())
-       (defun ,(fname '#:make) (keys columns)
-         (make-data ',class keys columns))
+       (defun ,(fname '#:make) (keys columns &key (column-types t) (incomplete-cases nil) )
+         (make-data ',class keys columns :column-types column-types :incomplete-cases incomplete-cases) )
        (defun ,alist-fn (alist)
          (alist-data ',class alist))
        (defun ,plist-fn (plist)
@@ -460,20 +545,49 @@ TABLE maps keys to indexes, starting from zero."
 (defmethod check-column-compatibility ((data data-frame) column)
   (assert (= (column-length column) (aops:nrow data))))
 
+(defmethod count-incomplete-cases ((data data-frame))
+  (count t (get-incomplete-cases data)))
+
+(defmethod print-row ((data data-frame) row )
+  (let ((widths (push 10 (get-print-widths data))))
+    (format t " ~{~a ~}~%"  row)))
+
+(defmethod row ((data data-frame) index)
+  "return row at index as a list with the row number s the first element"
+  (let ((columns (map 'list (curry #'column data-frame) (ensure-list (keys data-frame)))))
+    (cons index  (mapcar (lambda (column) (ref column index)) columns))))
+
+(defmethod list-incomplete-cases ((data data-frame))
+  (let ((nrow (aops:nrow data-frame))
+	(incomplete (get-incomplete-cases data-frame)))
+    (dotimes (index nrow (values))
+      (when (ref incomplete index)
+	(print-row  (data row ))))))
+
 (defparameter *column-summary-minimum-length* 10
   "Columns are only summarized when longer than this, otherwise they are returned as is.")
+;;
+;; previously, columns would be summarized , which for a large data frame resulted in tons of effectively useless output. We just print the first 10 rows of the data frame and provide a function to summarise the df. The column summaries can be printed explicitly when desired
+;;
 (defmethod print-object ((data-frame data-frame) stream)
-  (let ((alist (as-alist data-frame))
-        (summarize? (<= *column-summary-minimum-length* (aops:nrow data-frame))))
+  (let ((alist (as-alist data-frame)))
     (pprint-logical-block (stream alist)
       (print-unreadable-object (data-frame stream :type t)
-        (format stream "(~d x ~d)" (length alist) (aops:nrow data-frame))
+        (format stream "(~d x ~d)~%" (length alist) (aops:nrow data-frame))
+	(format stream "Incomplete Cases ~d~%" (count-incomplete-cases data-frame))
         (loop (pprint-exit-if-list-exhausted)
               (pprint-newline :mandatory stream)
               (let+ (((key . column) (pprint-pop)))
-                (format stream "~W ~W" key (if summarize?
-                                               (column-summary column)
-                                               column))))))))
+                (format stream "~W ~W" key 		
+			(subseq  column 0
+				 (min *column-summary-minimum-length* (length column))))))))))
+
+(defun summarize (df &key (columns t))
+  "print out columns summaries. When columns is t, print all, or just do the columns specified in a list"
+  (values ))
+
+
+
 
 (defun matrix-df (keys matrix)
   "Convert a matrix to a data-frame with the given keys."
