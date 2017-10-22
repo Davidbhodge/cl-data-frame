@@ -283,7 +283,7 @@ TABLE maps keys to indexes, starting from zero."
        (1+ (ecase type
 	  (NUMBER (log (reduce-column #'max c) 10))
 	  (DATE   (log (reduce-column #'max c) 10))
-	  (STRING (reduce-column #'max (mapcar #'length c)))
+	  (STRING (reduce-column #'max (map 'vector (lambda (item) (length item) ) c)))
 	  (CATEGORY (reduce-column #'max (mapcar (lambda (s) (length (symbol-name s))) c)))))))
 
 
@@ -313,9 +313,9 @@ TABLE maps keys to indexes, starting from zero."
 					    :initial-contents column-types)
 		   :incomplete-cases (make-array n-rows
 						 :adjustable t
-						 :fill-pointer n-columns
+						 :fill-pointer n-rows
 						 :initial-contents incomplete-cases)
-		   :print-widths (make-array n-rows
+		   :print-widths (make-array n-columns
 						 :adjustable t
 						 :fill-pointer n-columns
 						 :initial-contents (determine-print-widths columns column-types)))))
