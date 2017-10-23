@@ -267,24 +267,29 @@ TABLE maps keys to indexes, starting from zero."
 (defmethod aops:element-type ((data data))
   t)
 
+(defun isna (x)
+  (eql x :na))
 
 (defun reduce-column ( function column )
-  "reduce a column of a df with function yielding a scalar"
+  "reduce a column of a df with function yielding a scalar. If an :na appears in the first rows, handle that, likewise if the column is only 1 item. will need to be optimised"
   
-  (loop with result = (aref column 0)
-	for i from 1 below (length column) do
-       (if (eql (aref column i) 'na)
-	   (warn "reducing incomplete case. case ~a skipped~%" i)
-	   (setf result (funcall function result (aref  column i))))
-     finally (return result)))
+  (let* ((start (loop for i below (length column) while  (isna (aref column i)) finally (return i) ))
+	(result (aref column start)))
+    (if (> start (length column) )
+	result
+	(loop  for i from start  below (length column) do
+		(if (isna (aref column i))
+		    (warn "reducing incomplete case. case ~a skipped~%" i)
+		    (setf result (funcall function result (aref  column i))))
+	      finally (return result)))))
 
 (defun determine-print-widths (cols types)
   (loop for c in cols and type in types collect
        (1+ (ecase type
 	  (NUMBER (log (reduce-column #'max c) 10))
 	  (DATE   (log (reduce-column #'max c) 10))
-	  (STRING (reduce-column #'max (map 'vector (lambda (item) (length item) ) c)))
-	  (CATEGORY (reduce-column #'max (mapcar (lambda (s) (length (symbol-name s))) c)))))))
+	  (STRING (reduce-column #'max (map 'vector (lambda (item) (if (eql item :na) 3  (length item)) ) c)))
+	  (CATEGORY (reduce-column #'max (mapcar (lambda (s) (if (eql s :na) 3  (length (symbol-name s)))) c)))))))
 
 
 (defun make-data (class keys columns &key (column-types t column-types-supplied-p) (incomplete-cases nil))
